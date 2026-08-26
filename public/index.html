@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Crypto prices — codriver app</title>
+<style>
+/* ============================================================================
+   THEME TOKENS — same two-theme contract as the other codriver apps.
+   The host tells us which via `context`; we flip one attribute, so a theme
+   change costs a style recalc, never a refetch.
+
+   Up/down colours are NOT the usual saturated red/green: on a sunlit
+   windscreen those vibrate, and at night they bloom. These are desaturated
+   enough to read at a glance and calm enough to sit in peripheral vision
+   while someone is driving.
+   ========================================================================= */
+:root {
+  --bg: #0c0e11; --bg-elev: #14171c;
+  --fg: #e9ecef; --fg-muted: #9aa2ad; --fg-faint: #6b7480;
+  --rule: rgba(255,255,255,.09);
+  --up: #5cc98a; --down: #ff6a52; --flat: #9aa2ad;
+  --fs: 13.5px;
+}
+:root[data-theme="light"] {
+  --bg: #f2f3f5; --bg-elev: #ffffff;
+  --fg: #14171c; --fg-muted: #5b6470; --fg-faint: #8b939e;
+  --rule: rgba(0,0,0,.10);
+  --up: #1e7d47; --down: #c2381f; --flat: #5b6470;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 400 var(--fs)/1.25 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  display: flex; flex-direction: column;
+  overflow: hidden;                 /* the slot never scrolls; we trim instead */
+  padding: calc(var(--fs) * .5) calc(var(--fs) * .6);
+  font-variant-numeric: tabular-nums;   /* prices must not jitter on update */
+}
+
+header {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: .5em; flex: 0 0 auto;
+  padding-bottom: calc(var(--fs) * .3);
+  border-bottom: 1px solid var(--rule);
+}
+.title { font-size: .78em; letter-spacing: .07em; text-transform: uppercase; color: var(--fg-faint); }
+.stamp { font-size: .72em; color: var(--fg-faint); white-space: nowrap; }
+
+#rows { flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center; gap: calc(var(--fs) * .18); min-height: 0; }
+
+.row { display: flex; align-items: baseline; gap: .5em; }
+.sym  { flex: 0 0 auto; font-weight: 600; font-size: .95em; letter-spacing: .02em; }
+.px   { flex: 1 1 auto; text-align: right; font-size: 1.05em; font-weight: 600; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; }
+.chg  { flex: 0 0 auto; font-size: .82em; font-weight: 600; white-space: nowrap; min-width: 4.2em; text-align: right; }
+.chg[data-dir="up"]   { color: var(--up); }
+.chg[data-dir="down"] { color: var(--down); }
+.chg[data-dir="flat"] { color: var(--flat); }
+
+/* One message element for every non-data state. Keeping empty/loading/error in
+   one place is what stops the panel flickering between three layouts. */
+#msg { flex: 1 1 auto; display: none; align-items: center; justify-content: center;
+       text-align: center; color: var(--fg-muted); font-size: .85em; padding: 0 .4em; }
+body[data-state="msg"] #rows { display: none; }
+body[data-state="msg"] #msg  { display: flex; }
+.stale { color: var(--fg-faint); }
+</style>
+</head>
+<body data-state="msg">
+  <header>
+    <span class="title" id="title">Crypto</span>
+    <span class="stamp" id="stamp"></span>
+  </header>
+  <div id="rows" aria-live="off"></div>
+  <div id="msg">Waiting for codriver…</div>
+
+<script>
+"use strict";
+/* ============================================================================
+   A codriver app: crypto prices in a widget slot.
+
+   WHAT THIS IS
+   A page codriver embeds in a sandboxed, cross-origin iframe beside the map.
+   It cannot read the driver's codriver session, location or route, and does not
+   ask to. It receives its settings in a postMessage and renders ~300x130 px.
+
+   DATA SOURCE
+   CoinGecko's public /simple/price endpoint. No key, CORS-open, and it returns
+   price + 24h change in one call for every coin at once — which is the whole
+   reason it was picked over a per-symbol API. One request per refresh, no
+   matter how many coins are configured.
+
+   WHY 60s AND NOT FASTER
+   The free tier is a shared bucket (~10-30 req/min across all anonymous
+   callers) and 429s are common at peak. A driver glancing at a price does not
+   need sub-minute freshness, and a widget that rate-limits itself into an
+   error state is worse than one that is a minute stale. On a 429 we keep
+   showing the last good numbers and mark them stale rather than blanking.
+
+   SECURITY POSTURE
+   No innerHTML anywhere in this file, deliberately: every value from the API
+   is written with textContent onto nodes we constructed. Coin ids are
+   URL-encoded before they reach the query string.
+   ========================================================================= */
+
+var REFRESH_MS   = 60000;
+var TIMEOUT_MS   = 12000;
+var MAX_ROWS     = 3;      /* what fits in 130px at the default type scale */
+var API          = "https://api.coingecko.com/api/v3/simple/price";
+
+var el = {
+  title: document.getElementById("title"),
+  stamp: document.getElementById("stamp"),
+  rows:  document.getElementById("rows"),
+  msg:   document.getElementById("msg")
+};
+
+var state = {
+  cfg: null,          /* {coins, currency} as last applied */
+  hostOrigin: null,   /* pinned on the first accepted context */
+  data: null,         /* last good API payload */
+  fetchedAt: 0,
+  timer: null,
+  inflight: false,
+  stale: false
+};
+
+/* -------------------------------------------------------------- presentation */
+
+function setMsg(text) {
+  el.msg.textContent = text;
+  document.body.setAttribute("data-state", "msg");
+}
+
+/* CoinGecko ids are lowercase slugs ("bitcoin"); drivers expect tickers. This
+   covers the majors and falls back to a readable form of the id, so an
+   unlisted coin still renders sensibly instead of blank. */
+var TICKERS = {
+  bitcoin: "BTC", ethereum: "ETH", solana: "SOL", cardano: "ADA",
+  ripple: "XRP", dogecoin: "DOGE", polkadot: "DOT", chainlink: "LINK",
+  litecoin: "LTC", "avalanche-2": "AVAX", "matic-network": "MATIC",
+  "binancecoin": "BNB", "tron": "TRX", "monero": "XMR", "stellar": "XLM"
+};
+function ticker(id) {
+  if (TICKERS[id]) return TICKERS[id];
+  var head = String(id).split("-")[0];
+  return head.slice(0, 5).toUpperCase();
+}
+
+var SYMBOLS = { eur: "€", usd: "$", gbp: "£", jpy: "¥", chf: "CHF", cad: "CA$", aud: "A$" };
+
+/* Significant-figure-ish formatting: a driver needs the magnitude, not eight
+   decimals of a memecoin. Big numbers lose their decimals entirely because at
+   67,868 the cents are noise, and the slot is narrow. */
+function money(v, cur) {
+  var sym = SYMBOLS[cur] || "";
+  var abs = Math.abs(v), digits;
+  if (abs >= 1000) digits = 0;
+  else if (abs >= 1) digits = 2;
+  else if (abs >= 0.01) digits = 4;
+  else digits = 6;
+  var n = v.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  return sym ? sym + n : n + " " + cur.toUpperCase();
+}
+
+function pct(v) {
+  var s = (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
+  return s;
+}
+
+function render() {
+  if (!state.data || !state.cfg) return;
+  var cur = state.cfg.currency;
+  var ids = state.cfg.coins.slice(0, MAX_ROWS);
+
+  /* Rebuild rather than diff: at most three rows, and a rebuild cannot leave a
+     stale value behind if the API drops a coin between refreshes. */
+  el.rows.textContent = "";
+  var shown = 0;
+
+  ids.forEach(function (id) {
+    var d = state.data[id];
+    if (!d || typeof d[cur] !== "number") return;
+    shown++;
+
+    var row = document.createElement("div"); row.className = "row";
+
+    var sym = document.createElement("span");
+    sym.className = "sym"; sym.textContent = ticker(id);
+
+    var px = document.createElement("span");
+    px.className = "px"; px.textContent = money(d[cur], cur);
+
+    var chg = document.createElement("span");
+    chg.className = "chg";
+    var ch = d[cur + "_24h_change"];
+    if (typeof ch === "number" && isFinite(ch)) {
+      chg.textContent = pct(ch);
+      chg.setAttribute("data-dir", ch > 0.05 ? "up" : ch < -0.05 ? "down" : "flat");
+    } else {
+      chg.textContent = "—";
+      chg.setAttribute("data-dir", "flat");
+    }
+
+    row.appendChild(sym); row.appendChild(px); row.appendChild(chg);
+    el.rows.appendChild(row);
+  });
+
+  if (!shown) {
+    setMsg("No prices for those coin ids. Check them at codriver.io/account.");
+    return;
+  }
+  document.body.setAttribute("data-state", "data");
+  stampNow();
+}
+
+function stampNow() {
+  if (!state.fetchedAt) { el.stamp.textContent = ""; return; }
+  var mins = Math.floor((Date.now() - state.fetchedAt) / 60000);
+  var t;
+  if (mins < 1) t = "now";
+  else if (mins < 60) t = mins + "m";
+  else t = Math.floor(mins / 60) + "h";
+  el.stamp.textContent = state.stale ? t + " · stale" : t;
+  el.stamp.className = "stamp" + (state.stale ? " stale" : "");
+}
+
+/* ---------------------------------------------------------------- data path */
+
+function load() {
+  if (!state.cfg || state.inflight) return;
+  state.inflight = true;
+
+  var url = API
+    + "?ids=" + state.cfg.coins.map(encodeURIComponent).join(",")
+    + "&vs_currencies=" + encodeURIComponent(state.cfg.currency)
+    + "&include_24hr_change=true";
+
+  var ctl = new AbortController();
+  var to = setTimeout(function () { ctl.abort(); }, TIMEOUT_MS);
+
+  fetch(url, { signal: ctl.signal, headers: { Accept: "application/json" } })
+    .then(function (res) {
+      if (res.status === 429) throw new Error("ratelimit");
+      if (!res.ok) throw new Error("http" + res.status);
+      return res.json();
+    })
+    .then(function (json) {
+      state.data = json; state.fetchedAt = Date.now(); state.stale = false;
+      render();
+    })
+    .catch(function (e) {
+      /* Keep the last good numbers on screen and say they are old. A blank
+         panel tells the driver nothing; a stale price still tells them the
+         magnitude, which is what a glance is for. */
+      if (state.data) { state.stale = true; render(); }
+      else if (e && e.message === "ratelimit") setMsg("Rate limited. Retrying shortly.");
+      else setMsg("Can't reach the price service.");
+    })
+    .finally(function () { clearTimeout(to); state.inflight = false; });
+}
+
+function schedule() {
+  if (state.timer) clearInterval(state.timer);
+  state.timer = setInterval(function () {
+    if (document.hidden) return;   /* hidden frames are throttled anyway; do not queue work */
+    load();
+  }, REFRESH_MS);
+}
+
+/* A hidden frame's timers are throttled hard by Chromium, so coming back from
+   hidden is the moment to check whether what is on screen is old. */
+document.addEventListener("visibilitychange", function () {
+  if (document.hidden) return;
+  stampNow();
+  if (Date.now() - state.fetchedAt > REFRESH_MS) load();
+});
+
+/* Cheap: keeps "3m" honest without refetching. */
+setInterval(function () { if (!document.hidden) stampNow(); }, 30000);
+
+/* ------------------------------------------------------------------ the SDK */
+
+function setUiSize(n) {
+  /* The published suggestion: ~11px at 1, 14px at the default 6, 16.5px at 10.
+     Everything in the stylesheet is sized off --fs, so one property rescales
+     the whole panel coherently. */
+  var lvl = (typeof n === "number" && n >= 1 && n <= 10) ? n : 6;
+  document.documentElement.style.setProperty("--fs", (10.5 + lvl * 0.6).toFixed(2) + "px");
+}
+
+function applyConfig(cfg) {
+  var coins = String((cfg && cfg.coins) || "bitcoin,ethereum")
+    .split(",").map(function (s) { return s.trim().toLowerCase(); })
+    .filter(Boolean).slice(0, MAX_ROWS);
+  if (!coins.length) coins = ["bitcoin", "ethereum"];
+
+  var currency = String((cfg && cfg.currency) || "eur").trim().toLowerCase();
+  if (!/^[a-z]{3}$/.test(currency)) currency = "eur";
+
+  var changed = !state.cfg
+    || state.cfg.currency !== currency
+    || state.cfg.coins.join(",") !== coins.join(",");
+
+  state.cfg = { coins: coins, currency: currency };
+  el.title.textContent = "Crypto · " + currency.toUpperCase();
+
+  if (changed) {
+    /* Settings changed: what is on screen is about to be wrong, so drop it
+       rather than briefly showing the previous currency's numbers. */
+    state.data = null; state.fetchedAt = 0; state.stale = false;
+    setMsg("Loading…");
+    load();
+    schedule();
+  }
+}
+
+window.addEventListener("message", function (ev) {
+  var d = ev.data;
+  if (!d || d.codriver !== 1 || d.type !== "context") return;
+
+  /* Trust-on-first-use origin pinning. We cannot know the host origin ahead of
+     time (codriver runs on prod, staging and localhost), so we accept the
+     first well-formed context and require every later one to match it. */
+  if (state.hostOrigin === null) state.hostOrigin = ev.origin;
+  else if (ev.origin !== state.hostOrigin) return;
+
+  document.documentElement.setAttribute("data-theme", d.theme === "light" ? "light" : "dark");
+  setUiSize(d.uiSize);
+  /* `units` is accepted and ignored — currency is its own setting here. Unknown
+     fields are ignored too: the host may add them in a later version. */
+  applyConfig(d.config || {});
+});
+
+/* `ready` is the one message we send. It carries no data, which is why '*' is
+   acceptable: at this point we do not know who framed us. The host answers
+   with a context snapshot, and re-posting ready is the supported way to ask
+   for a fresh one. */
+try { window.parent.postMessage({ codriver: 1, type: "ready" }, "*"); } catch (e) {}
+
+/* Standalone (someone opened the URL directly, or the dev harness has not
+   posted yet): show something real rather than a permanent "waiting". */
+setTimeout(function () {
+  if (!state.cfg) applyConfig({});
+}, 1200);
+</script>
+</body>
+</html>

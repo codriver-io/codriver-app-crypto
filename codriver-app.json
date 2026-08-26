@@ -1,0 +1,21 @@
+{
+  "$comment": "Manifest for the codriver app marketplace.",
+  "name": "Crypto prices",
+  "description": "Live prices and 24-hour change for the coins you pick, beside the map. Any currency CoinGecko supports.",
+  "install_instructions": "In codriver.io/account -> Apps -> Crypto prices, list the coins you want using their CoinGecko ids (bitcoin, ethereum, solana...) separated by commas, and pick a currency such as eur or usd. Three coins fit in a slot. Prices refresh about once a minute.",
+  "integration_types": ["widget"],
+  "widget_url": "https://crypto-codriver.pages.dev",
+  "website_url": "https://crypto-codriver.pages.dev",
+  "docs_url": "https://developer.codriver.io/guides/build-an-app",
+  "cost_model": "free",
+  "version": "1.0.0",
+  "config_schema": {
+    "fields": [
+      { "key": "coins", "label": "Coins", "type": "string", "required": true,
+        "default": "bitcoin,ethereum", "maxLength": 120,
+        "help": "CoinGecko ids, comma separated. First three are shown." },
+      { "key": "currency", "label": "Currency", "type": "string", "required": true,
+        "default": "eur", "maxLength": 3, "help": "Three-letter code: eur, usd, gbp..." }
+    ]
+  }
+}
