@@ -1,4 +1,20 @@
-# Crypto prices for codriver
+# Crypto prices — codriver app example
+
+A minimal example for developers building [codriver.io](https://codriver.io)
+apps with plain HTML, CSS and JavaScript. It demonstrates the `ready` / `context`
+handshake, host-provided settings, light and dark themes, and adjustable UI size.
+
+## Use this example
+
+- `public/index.html` — the widget, including rendering and data fetching.
+- `public/dev.html` — a local host simulator with settings and a resizable slot.
+- `codriver-app.json` — example marketplace metadata and configuration fields.
+
+To build your own app, replace the price display and data source, update the
+manifest, and host your page at your own HTTPS URL. If using the included
+Cloudflare deployment command, change its project name in `package.json` first.
+
+## Crypto widget
 
 Live prices and 24-hour change for the coins you pick, in a codriver widget slot. Data from [CoinGecko](https://www.coingecko.com/en/api)'s public API — no key, one request per refresh however many coins you list.
 
@@ -64,4 +80,6 @@ animation, no `requestAnimationFrame`, one low-frequency timer, and work stops
 when the frame is hidden. Chromium throttles hidden frames hard, so returning
 from hidden re-checks freshness rather than assuming the timer kept running.
 
-MIT licensed.
+The source code is MIT licensed. CoinGecko data and API access are governed
+separately by [CoinGecko's API terms](https://www.coingecko.com/en/api_terms);
+this repository's license does not grant rights to their data or service.
